@@ -1,5 +1,7 @@
 import json
 import os
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -7,20 +9,15 @@ from datetime import datetime, timedelta, timezone
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ.get("CHAT_ID", "@nerkh_roooz")
 
-# (نماد نوبیتکس, نام فارسی) -- نمادها را می‌توانید اینجا تغییر دهید
-USD_COINS = [
-    ("btc", "بیتکوین"),
-    ("eth", "اتریوم"),
-    ("trx", "ترون"),
-    ("gram", "گرام (تون)"),
-    ("oil", "توکن نفت"),  # اگر در نوبیتکس نبود، خودکار رد می‌شود
-]
-TOMAN_COINS = [
-    ("usdt", "تتر"),
-    ("btc", "بیتکوین"),
-    ("eth", "اتریوم"),
-    ("trx", "ترون"),
-    ("gram", "گرام (تون)"),
+# منبع قیمت: صرافی والکس (قیمت‌ها از قبل به تومان هستند)
+WALLEX_URL = "https://api.wallex.ir/v1/markets"
+
+# (نماد پایه در والکس, نام فارسی) -- برای افزودن یا حذف ارز همین لیست را عوض کنید
+COINS = [
+    ("BTC", "بیتکوین"),
+    ("ETH", "اتریوم"),
+    ("TRX", "ترون"),
+    ("GRAM", "گرام (تون)"),
 ]
 
 FA = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
@@ -30,27 +27,33 @@ def fa(s):
     return str(s).translate(FA)
 
 
-def fetch_stats():
-    symbols = sorted({c for c, _ in USD_COINS + TOMAN_COINS} | {"paxg"})
-    qs = urllib.parse.urlencode(
-        {"srcCurrency": ",".join(symbols), "dstCurrency": "rls,usdt"}
-    )
-    req = urllib.request.Request(
-        "https://api.nobitex.ir/market/stats?" + qs,
-        headers={"User-Agent": "Mozilla/5.0"},
-    )
-    with urllib.request.urlopen(req, timeout=30) as r:
-        data = json.load(r)
-    if data.get("status") != "ok":
-        raise RuntimeError(f"Nobitex error: {data}")
-    return data["stats"]
+def fetch_markets():
+    last = None
+    for _ in range(3):
+        try:
+            req = urllib.request.Request(
+                WALLEX_URL, headers={"User-Agent": "Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.load(r)["result"]["symbols"]
+        except Exception as e:  # noqa: BLE001
+            last = e
+            time.sleep(3)
+    raise RuntimeError(f"Wallex fetch failed: {last}")
 
 
-def get(stats, src, dst):
-    s = stats.get(f"{src}-{dst}")
-    if not s or not s.get("latest"):
+def get(syms, symbol):
+    """قیمت آخر و درصد تغییر ۲۴ ساعته؛ اگر نبود (None, None)."""
+    stats = (syms.get(symbol) or {}).get("stats") or {}
+    try:
+        price = float(stats["lastPrice"])
+    except (KeyError, ValueError, TypeError):
         return None, None
-    return float(s["latest"]), float(s.get("dayChange") or 0)
+    try:
+        change = float(stats["24h_ch"])
+    except (KeyError, ValueError, TypeError):
+        change = 0.0
+    return price, change
 
 
 def dot(change):
@@ -65,60 +68,79 @@ def fmt_usd(p):
     return f"{p:.6f}".rstrip("0").rstrip(".")
 
 
-def build_message(stats):
-    lines = []
+def build_message(syms):
+    usd_lines = []
+    toman_lines = []
 
     # بخش دلاری
-    for sym, _ in USD_COINS:
-        p, ch = get(stats, sym, "usdt")
+    for base, _ in COINS:
+        p, ch = get(syms, base + "USDT")
         if p is None:
             continue
         arrow = "↑" if ch >= 0 else "↓"
-        lines.append(f"{dot(ch)} {sym.upper()}: ${fmt_usd(p)} ({arrow}{abs(ch):.2f}%)")
+        usd_lines.append(f"{dot(ch)} {base}: ${fmt_usd(p)} ({arrow}{abs(ch):.2f}%)")
 
-    lines.append("")
-
-    # بخش تومانی (قیمت‌ها در API به ریال است)
-    for sym, name in TOMAN_COINS:
-        p, ch = get(stats, sym, "rls")
+    # بخش تومانی: اول تتر، بعد بقیه
+    for base, name in [("USDT", "تتر")] + COINS:
+        p, ch = get(syms, base + "TMN")
         if p is None:
             continue
-        toman = p / 10
         arrow = "↑" if ch >= 0 else "↓"
-        lines.append(
-            f"{dot(ch)} {name}: {fa(f'{toman:,.0f}')} تومان ({fa(f'{abs(ch):.2f}')}٪{arrow})"
+        toman_lines.append(
+            f"{dot(ch)} {name}: {fa(f'{p:,.0f}')} تومان ({arrow}{fa(f'{abs(ch):.2f}')}٪)"
         )
 
-    # طلای ۱۸ عیار محاسبه‌ای از روی PAXG (هر PAXG = یک اونس)
-    paxg, ch = get(stats, "paxg", "usdt")
-    usdt_rls, _ = get(stats, "usdt", "rls")
+    if not usd_lines and not toman_lines:
+        raise RuntimeError("No prices found in Wallex response")
+
+    # طلای ۱۸ عیار: محاسباتی از روی PAXG (هر PAXG برابر یک اونس طلا)
     gold_block = ""
-    if paxg and usdt_rls:
-        gram18_toman = paxg / 31.1035 * 0.75 * usdt_rls / 10
+    paxg_tmn, _ = get(syms, "PAXGTMN")
+    paxg_usd, _ = get(syms, "PAXGUSDT")
+    if paxg_tmn:
+        gram18 = paxg_tmn / 31.1035 * 0.75
         gold_block = (
-            "\n<blockquote expandable>"
-            f"🟡 طلای ۱۸ عیار (محاسباتی): {fa(f'{gram18_toman:,.0f}')} تومان\n"
-            f"اونس جهانی (PAXG): ${fmt_usd(paxg)}"
-            "</blockquote>"
+            "\n\n<blockquote expandable>🟡 قیمت طلا (محاسباتی از روی PAXG)\n"
+            f"طلای ۱۸ عیار: {fa(f'{gram18:,.0f}')} تومان"
         )
+        if paxg_usd:
+            gold_block += f"\nاونس جهانی: ${fmt_usd(paxg_usd)}"
+        gold_block += "</blockquote>"
 
     tehran = datetime.now(timezone(timedelta(hours=3, minutes=30)))
-    footer = f"\n⏰ {fa(tehran.strftime('%H:%M'))} – {fa(tehran.strftime('%Y/%m/%d'))}"
+    footer = (
+        f"\n\n⏰ {fa(tehran.strftime('%H:%M'))} – {fa(tehran.strftime('%Y/%m/%d'))}"
+        "\nمنبع: والکس"
+    )
 
-    return "📊 <b>نرخ لحظه‌ای بازار</b>\n\n" + "\n".join(lines) + "\n" + gold_block + footer
+    parts = ["📊 <b>قیمت لحظه‌ای بازار</b>"]
+    if usd_lines:
+        parts.append("\n".join(usd_lines))
+    if toman_lines:
+        parts.append("\n".join(toman_lines))
+    return "\n\n".join(parts) + gold_block + footer
 
 
 def send(text):
     body = urllib.parse.urlencode(
-        {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
-         "disable_web_page_preview": "true"}
+        {
+            "chat_id": CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        }
     ).encode()
     req = urllib.request.Request(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", data=body
     )
-    with urllib.request.urlopen(req, timeout=30) as r:
-        print(r.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            print(r.read().decode())
+    except urllib.error.HTTPError as e:
+        # متن خطای تلگرام را چاپ می‌کنیم تا علت مشخص شود
+        print("Telegram error:", e.code, e.read().decode("utf-8", "replace"))
+        raise
 
 
 if __name__ == "__main__":
-    send(build_message(fetch_stats()))
+    send(build_message(fetch_markets()))
